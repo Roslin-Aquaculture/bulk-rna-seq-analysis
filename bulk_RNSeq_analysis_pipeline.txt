@@ -1,0 +1,71 @@
+###########################################################
+###        BULK RNASEQ ANALYSIS PIPELINE              #####
+###fastqc + trimmomatic + hisat2 + htseq-count + edgeR#####
+###                        Robert Mukiibi             #####
+### ***********mukiibi@ualberta.ca****************    #####
+###########################################################
+
+#1. quality assessment of the sequence data using fastqc 
+#https://www.bioinformatics.babraham.ac.uk/projects/fastqc/
+fastqc *.fq  -o ouputFoldername 2> logFile.log
+
+#2. clean sequence data of poor quality reads, adaptor trimming etc using trimmomatic
+# http://www.usadellab.org/cms/?page=trimmomatic
+java -jar /Trimmomatic-0.39/trimmomatic-0.39.jar PE -phred33 R1.fq R2.fq $R1paired $R1unpaired $R2paired $R2unpaired ILLUMINACLIP:/Trimmomatic-0.39/adapters/TruSeq3-PE.fa:2:30:10 \
+LEADING:20 TRAILING:20 SLIDINGWINDOW:4:20 MINLEN:36 2> logFile.log
+
+#3. Index the reference genome using hisat2-build
+## http://daehwankimlab.github.io/hisat2/
+module load igmm/apps/HISAT2/2.1.0
+hisat2-build reference_genome.fa reference_genome
+
+#4. alignment to the reference_genome using hisat2 alignment program 
+module load igmm/apps/HISAT2/2.1.0
+hisat2 -q -x  reference_genome -1 R1paired.fq -2 R2paired.fq -S sample.sam --summary-file sample__alignmentSummary.tx
+
+#5. Count_number of read aligned to the genomic features using htseq-count
+#https://htseq.readthedocs.io/en/release_0.11.1/count.html
+htseq-count sample.sam -t gene -s yes $GTF_FILE.gtf > sample_counts.txt
+
+##################################################################################################################################
+##Differential expression analysis between Group A and Group B (Group is the treatment and A and B are the treatment classes) ####
+##Use the bioconductor package edgeR in R.                                                                                    ####
+##https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf                                 ####
+##################################################################################################################################
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("edgeR")
+library(edgeR)
+read_counts <- read.csv("counts_file.csv", header = T)###read counts file.
+rownames(read_counts) <- read_counts[, 1]## set rownames
+read_counts<- read_counts[, -1]
+sample_info <- read.csv("sample_info.csv")###read experimental information file
+rownames(sample_info) <- sample_info[, 1]## set rownames
+sample_info<- sample_info[, -1] ##
+gene_anno<-read.csv("annotation_file.csv")###Read the annotation file.
+dim(gene_anno)
+rownames(gene_anno) <- gene_anno[, 1]## set rownames of the annotation information dataframe
+gene_anno<- gene_anno[, -1] ## remove the first variable
+
+####create dge list object########################################
+dge<-DGEList(counts = dgList$counts, group = sample_info$Group, genes = gene_anno)##create dge list
+col2 = rainbow(2)
+###explore divergence using MDS plot 
+plotMDS(dge, top = 24969, dim.plot =c(1,2), pch = 8,labels = row.names(sample_info), gene.selection = "common",main = "MDS PLOT", cex = 0.8, col = col2[as.factor(sample_info$Group)])
+#####filter out the very low expressed genes########################################
+dge_expressed<-dge[rowSums(cpm(dge) > 1) >=6,]##filter out cpm less than 1
+dge_expressed$samples$lib.size <- colSums(dge_expressed$counts) ##reculate library sizes
+dge_expressed <- calcNormFactors(dge_expressed, method = "TMM")##normalize the data
+#####STATISTICAL MODELING #############################
+Group <-relevel(Group, ref = "A")## set reference group or level of the group
+design<-model.matrix(~Group)## define the statistical model
+dispersions<-estimateGLMCommonDisp(dge_expressed, design, verbose = TRUE)## dispersion estimates
+dispersions<-estimateGLMTrendedDisp(dispersions, design)## dispersion estimates
+dispersions<-estimateGLMTrendedDisp(dispersions, design)## dispersion estimates
+fit<-glmFit(dispersions, design)##fit the negative glmm with the dispersions
+lrt<-glmLRT(fit, coef = "GroupB")## run likelihood ratio tests
+lrt_top <- topTags(lrt, n=nrow(dge_expressed$counts), adjust.method = "BH", sort.by = "PValue")
+FDR_cutoff<- 0.05 ##set statistical significance threshold.
+plotSmear(dge_expressed, pair=c("A", "B"), main = "MA plot", de.tags=row.names(lrt_top$table) [lrt_top$table$FDR < FDR_cutoff])###PLOT A SMEAR PLOT TO VISUALISE differential gene expression
+dgegenes<- lrt_top$table[abs(lrt_top$table$logFC) >= log2(2) & lrt_top$table$FDR<FDR_cutoff & lrt_top$table$logCPM > 2, ] ##extract differentially expressed genes list at a threshold of >= 2 fold change and < 0.05 FDR
+write.csv(dgegenes, file = "de_genes.csv")##save the de_genes
